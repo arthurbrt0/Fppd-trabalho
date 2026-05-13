@@ -1,3 +1,6 @@
+// Ladrão no Labirinto — terminal arcade com concorrência em Go.
+// Arquitetura: tick dedicado, leitor de eventos tcell, duas sondas autónomas,
+// coordenador com select, renderizador com mutex apenas no acesso ao ecrã.
 package main
 
 import (
@@ -11,8 +14,20 @@ import (
 )
 
 const (
-	innerW = 56
-	innerH = 16
+	innerW       = 56
+	innerH       = 16
+	maxLives     = 3
+	startSeconds = 90
+	invulnTicks  = 3
+	ticksPerSec  = 8 // ~120 ms por tick → contagem de segundos estável
+)
+
+type gamePhase int
+
+const (
+	phasePlaying gamePhase = iota
+	phaseWon
+	phaseLost
 )
 
 type pos struct {
@@ -31,22 +46,30 @@ const (
 
 // syncState é uma fotografia imutável enviada às sondas a cada tick.
 type syncState struct {
-	self    pos
-	player  pos
-	samples []pos
-	w, h    int
-	frame   int64
+	self      pos
+	player    pos
+	w, h      int
+	frame     int64
+	validDirs []direction
 }
 
 type world struct {
-	w, h      int
-	player    pos
-	probeA    pos
-	probeB    pos
-	samples   map[pos]struct{}
-	score     int
-	playerVel direction
-	frame     int64
+	w, h         int
+	player       pos
+	spawn        pos
+	probeA       pos
+	probeB       pos
+	samples      map[pos]struct{}
+	barriers     map[pos]struct{}
+	score        int
+	totalSamples int
+	lives        int
+	timeLeft     int
+	phase        gamePhase
+	loseReason   string
+	playerVel    direction
+	frame        int64
+	invuln       int
 }
 
 func (w *world) inBounds(p pos) bool {
@@ -54,7 +77,11 @@ func (w *world) inBounds(p pos) bool {
 }
 
 func (w *world) wall(p pos) bool {
-	return p.x == 0 || p.x == w.w-1 || p.y == 0 || p.y == w.h-1
+	if p.x == 0 || p.x == w.w-1 || p.y == 0 || p.y == w.h-1 {
+		return true
+	}
+	_, ok := w.barriers[p]
+	return ok
 }
 
 func step(p pos, d direction) pos {
@@ -84,26 +111,28 @@ func manhattan(a, b pos) int {
 	return x + y
 }
 
-// decideAlfa move em direção à amostra mais próxima; se não houver, patrulha o perímetro no sentido horário.
-func decideAlfa(s syncState) direction {
-	if len(s.samples) == 0 {
-		return patrolBorder(s.self, s.w, s.h)
-	}
-	best := s.samples[0]
-	bd := manhattan(s.self, best)
-	for _, p := range s.samples[1:] {
-		if d := manhattan(s.self, p); d < bd {
-			bd = d
-			best = p
+func (w *world) validDirsFrom(p pos) []direction {
+	all := []direction{dirUp, dirDown, dirLeft, dirRight}
+	out := make([]direction, 0, 4)
+	for _, d := range all {
+		n := step(p, d)
+		if w.inBounds(n) && !w.wall(n) {
+			out = append(out, d)
 		}
 	}
-	return greedyStep(s.self, best)
+	return out
 }
 
-func greedyStep(from, to pos) direction {
+// decideAlfa persegue o jogador de forma determinística (sem aleatoriedade dominante).
+func decideAlfa(s syncState) direction {
+	return chaseStep(s.self, s.player, s.frame)
+}
+
+func chaseStep(from, to pos, frame int64) direction {
 	dx, dy := to.x-from.x, to.y-from.y
+	preferX := frame%2 == 0
 	if dx != 0 && dy != 0 {
-		if rand.Intn(2) == 0 {
+		if preferX {
 			if dx > 0 {
 				return dirRight
 			}
@@ -134,23 +163,11 @@ func greedyStep(from, to pos) direction {
 	return dirNone
 }
 
-func patrolBorder(p pos, w, h int) direction {
-	// Perímetro interior: rectângulo [1,w-2] x [1,h-2]
-	if p.y == 1 && p.x < w-2 {
-		return dirRight
+func decideBeta(s syncState) direction {
+	if len(s.validDirs) == 0 {
+		return dirNone
 	}
-	if p.x == w-2 && p.y < h-2 {
-		return dirDown
-	}
-	if p.y == h-2 && p.x > 1 {
-		return dirLeft
-	}
-	return dirUp
-}
-
-func decideBeta(_ syncState) direction {
-	opts := []direction{dirUp, dirDown, dirLeft, dirRight}
-	return opts[rand.Intn(len(opts))]
+	return s.validDirs[rand.Intn(len(s.validDirs))]
 }
 
 func probeRoutine(
@@ -231,21 +248,17 @@ func applyDir(w *world, p pos, d direction) pos {
 }
 
 func buildSync(w *world, id int) syncState {
-	samps := make([]pos, 0, len(w.samples))
-	for p := range w.samples {
-		samps = append(samps, p)
-	}
 	self := w.probeA
 	if id == 2 {
 		self = w.probeB
 	}
 	return syncState{
-		self:    self,
-		player:  w.player,
-		samples: samps,
-		w:       w.w,
-		h:       w.h,
-		frame:   w.frame,
+		self:      self,
+		player:    w.player,
+		w:         w.w,
+		h:         w.h,
+		frame:     w.frame,
+		validDirs: w.validDirsFrom(self),
 	}
 }
 
@@ -254,6 +267,10 @@ func (w *world) snapshot() world {
 	cp.samples = make(map[pos]struct{}, len(w.samples))
 	for p := range w.samples {
 		cp.samples[p] = struct{}{}
+	}
+	cp.barriers = make(map[pos]struct{}, len(w.barriers))
+	for p := range w.barriers {
+		cp.barriers[p] = struct{}{}
 	}
 	return cp
 }
@@ -267,6 +284,9 @@ func keyQuit(e *tcell.EventKey) bool {
 }
 
 func applyPlayerKey(w *world, e *tcell.EventKey) {
+	if w.phase != phasePlaying {
+		return
+	}
 	switch e.Rune() {
 	case 'w', 'W':
 		w.playerVel = dirUp
@@ -278,6 +298,128 @@ func applyPlayerKey(w *world, e *tcell.EventKey) {
 		w.playerVel = dirRight
 	case ' ':
 		w.playerVel = dirNone
+	}
+}
+
+func (w *world) clearArea(center pos, radius int) {
+	for dy := -radius; dy <= radius; dy++ {
+		for dx := -radius; dx <= radius; dx++ {
+			p := pos{center.x + dx, center.y + dy}
+			delete(w.barriers, p)
+		}
+	}
+}
+
+func buildMazeBarriers(w, h int) map[pos]struct{} {
+	b := make(map[pos]struct{})
+	// Corredores horizontais com portas (estilo Pac-Man).
+	for y := 3; y < h-3; y += 4 {
+		for x := 2; x < w-2; x++ {
+			if x%5 == 3 || x%5 == 4 {
+				continue
+			}
+			b[pos{x, y}] = struct{}{}
+		}
+	}
+	// Pilares verticais alternados.
+	for x := 6; x < w-6; x += 6 {
+		for y := 2; y < h-2; y++ {
+			if y%4 == 2 {
+				continue
+			}
+			b[pos{x, y}] = struct{}{}
+		}
+	}
+	return b
+}
+
+func (w *world) isFree(p pos) bool {
+	return w.inBounds(p) && !w.wall(p) && p != w.player && p != w.probeA && p != w.probeB
+}
+
+func newWorld() *world {
+	ww := innerW + 2
+	hh := innerH + 2
+	spawn := pos{ww / 2, hh / 2}
+
+	barriers := buildMazeBarriers(ww, hh)
+	w := &world{
+		w:         ww,
+		h:         hh,
+		spawn:     spawn,
+		player:    spawn,
+		probeA:    pos{2, 2},
+		probeB:    pos{ww - 3, hh - 3},
+		barriers:  barriers,
+		samples:   make(map[pos]struct{}),
+		lives:     maxLives,
+		timeLeft:  startSeconds,
+		phase:     phasePlaying,
+		playerVel: dirNone,
+	}
+
+	w.clearArea(spawn, 2)
+	w.clearArea(w.probeA, 1)
+	w.clearArea(w.probeB, 1)
+
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	placed := 0
+	for placed < 14 {
+		p := pos{1 + rng.Intn(innerW), 1 + rng.Intn(innerH)}
+		if !w.isFree(p) {
+			continue
+		}
+		if _, ok := w.samples[p]; ok {
+			continue
+		}
+		w.samples[p] = struct{}{}
+		placed++
+	}
+	w.totalSamples = len(w.samples)
+	w.score = 0
+	return w
+}
+
+func (w *world) tickPlaying() {
+	if w.invuln > 0 {
+		w.invuln--
+	}
+	if w.frame%ticksPerSec == 0 && w.timeLeft > 0 {
+		w.timeLeft--
+	}
+
+	w.player = applyDir(w, w.player, w.playerVel)
+
+	if _, ok := w.samples[w.player]; ok {
+		delete(w.samples, w.player)
+		w.score++
+	}
+	if w.score >= w.totalSamples {
+		w.phase = phaseWon
+		return
+	}
+	if w.timeLeft <= 0 {
+		w.phase = phaseLost
+		w.loseReason = "tempo esgotado"
+		return
+	}
+}
+
+func (w *world) applyEnemyHits() {
+	if w.invuln > 0 || w.phase != phasePlaying {
+		return
+	}
+	hit := w.probeA == w.player || w.probeB == w.player
+	if !hit {
+		return
+	}
+	w.lives--
+	w.player = w.spawn
+	w.playerVel = dirNone
+	w.invuln = invulnTicks
+	if w.lives <= 0 {
+		w.phase = phaseLost
+		w.loseReason = "sem vidas"
 	}
 }
 
@@ -299,7 +441,6 @@ func coordinatorRoutine(
 
 	w := newWorld()
 
-	// Primeiro frame para o utilizador ver o estado inicial sem esperar pelo primeiro tick.
 	select {
 	case renderCh <- w.snapshot():
 	case <-ctx.Done():
@@ -312,7 +453,19 @@ func coordinatorRoutine(
 			return
 		case <-tickCh:
 			w.frame++
-			w.player = applyDir(w, w.player, w.playerVel)
+
+			if w.phase == phasePlaying {
+				w.tickPlaying()
+			}
+
+			if w.phase != phasePlaying {
+				select {
+				case renderCh <- w.snapshot():
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
 
 			select {
 			case syncA <- buildSync(w, 1):
@@ -348,26 +501,16 @@ func coordinatorRoutine(
 				}
 			}
 
-			nextA := applyDir(w, w.probeA, da)
-			nextB := applyDir(w, w.probeB, db)
-			if nextA == nextB {
-				nextB = w.probeB
+			// B move todo tick; A move a cada 2 ticks (mais lento que o jogador).
+			if w.frame%2 == 0 {
+				w.probeA = applyDir(w, w.probeA, da)
 			}
-			if nextA == w.player {
-				nextA = w.probeA
+			w.probeB = applyDir(w, w.probeB, db)
+			if w.probeA == w.probeB {
+				w.probeB = applyDir(w, w.probeB, db)
 			}
-			if nextB == w.player {
-				nextB = w.probeB
-			}
-			w.probeA = nextA
-			w.probeB = nextB
 
-			for _, p := range []pos{w.probeA, w.probeB} {
-				if _, ok := w.samples[p]; ok {
-					delete(w.samples, p)
-					w.score++
-				}
-			}
+			w.applyEnemyHits()
 
 			select {
 			case renderCh <- w.snapshot():
@@ -386,30 +529,6 @@ func coordinatorRoutine(
 				s.Sync()
 			}
 		}
-	}
-}
-
-func newWorld() *world {
-	w := innerW + 2
-	h := innerH + 2
-	samples := make(map[pos]struct{})
-	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
-	for i := 0; i < 12; i++ {
-		for tries := 0; tries < 50; tries++ {
-			p := pos{1 + rng.Intn(innerW), 1 + rng.Intn(innerH)}
-			if _, ok := samples[p]; ok {
-				continue
-			}
-			samples[p] = struct{}{}
-			break
-		}
-	}
-	return &world{
-		w: w, h: h,
-		player:  pos{w / 2, h / 2},
-		probeA:  pos{2, 2},
-		probeB:  pos{w - 3, h - 3},
-		samples: samples,
 	}
 }
 
@@ -437,38 +556,56 @@ func renderRoutine(ctx context.Context, s tcell.Screen, renderCh <-chan world, w
 						ch = '#'
 						st = st.Foreground(tcell.ColorGray)
 					case p == w.player:
-						ch = '@'
-						st = st.Foreground(tcell.ColorYellow)
+						ch = '$'
+						st = st.Foreground(tcell.ColorYellow).Bold(true)
 					case p == w.probeA:
 						ch = 'A'
-						st = st.Foreground(tcell.ColorGreen)
+						st = st.Foreground(tcell.ColorRed)
 					case p == w.probeB:
 						ch = 'B'
 						st = st.Foreground(tcell.ColorFuchsia)
 					default:
 						if _, ok := w.samples[p]; ok {
-							ch = '*'
-							st = st.Foreground(tcell.ColorAqua)
+							ch = '.'
+							st = st.Foreground(tcell.ColorGold)
 						} else {
-							ch = '·'
-							st = st.Foreground(tcell.ColorDarkGray)
+							ch = ' '
 						}
 					}
 					s.SetContent(x, y, ch, nil, st)
 				}
 			}
 			_, sh := s.Size()
-			statusY := sh - 1
+			statusY := sh - 2
 			if statusY < 0 {
 				statusY = 0
 			}
-			title := fmt.Sprintf(" Estação Sync | pontos: %d | WASD | espaço parar | Q/ESC sair ", w.score)
-			for i, r := range title {
-				s.SetContent(i, statusY, r, nil, styleDef.Foreground(tcell.ColorWhite))
+			statusY2 := sh - 1
+			if statusY2 < 0 {
+				statusY2 = 0
 			}
+
+			line1 := fmt.Sprintf(" LADRÃO | pontos %d/%d | vidas %d | tempo %ds | WASD mover | Q sair ",
+				w.score, w.totalSamples, w.lives, w.timeLeft)
+			line2 := " Capture todos os pontos e sobreviva! "
+			switch w.phase {
+			case phaseWon:
+				line2 = " *** VITÓRIA! Todos os pontos capturados! *** "
+			case phaseLost:
+				line2 = fmt.Sprintf(" *** DERROTA (%s)! Pressione Q para sair *** ", w.loseReason)
+			}
+
+			drawLine(s, 0, statusY, line1, styleDef.Foreground(tcell.ColorWhite))
+			drawLine(s, 0, statusY2, line2, styleDef.Foreground(tcell.ColorAqua))
 			s.Show()
 			mu.Unlock()
 		}
+	}
+}
+
+func drawLine(s tcell.Screen, x, y int, text string, st tcell.Style) {
+	for i, r := range text {
+		s.SetContent(x+i, y, r, nil, st)
 	}
 }
 
