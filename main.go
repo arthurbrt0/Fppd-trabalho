@@ -1,6 +1,3 @@
-// Estação Sync — simulação de terminal com concorrência em Go.
-// Arquitetura: tick dedicado, leitor de eventos tcell, duas sondas autónomas,
-// coordenador com select, renderizador com mutex apenas no acesso ao ecrã.
 package main
 
 import (
