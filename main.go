@@ -1,6 +1,4 @@
-// Ladrão no Labirinto — terminal arcade com concorrência em Go.
-// Arquitetura: tick dedicado, leitor de eventos tcell, duas sondas autónomas,
-// coordenador com select, renderizador com mutex apenas no acesso ao ecrã.
+// Jogo do ladrão no terminal (Go + tcell).
 package main
 
 import (
@@ -19,7 +17,7 @@ const (
 	maxLives     = 3
 	startSeconds = 90
 	invulnTicks  = 3
-	ticksPerSec  = 8 // ~120 ms por tick → contagem de segundos estável
+	ticksPerSec  = 8 // 8 ticks ≈ 1 segundo
 )
 
 type gamePhase int
@@ -44,7 +42,7 @@ const (
 	dirRight
 )
 
-// syncState é uma fotografia imutável enviada às sondas a cada tick.
+// syncState: cópia do estado para os inimigos decidirem movimento.
 type syncState struct {
 	self      pos
 	player    pos
@@ -123,7 +121,6 @@ func (w *world) validDirsFrom(p pos) []direction {
 	return out
 }
 
-// decideAlfa persegue o jogador de forma determinística (sem aleatoriedade dominante).
 func decideAlfa(s syncState) direction {
 	return chaseStep(s.self, s.player, s.frame)
 }
@@ -196,7 +193,6 @@ func probeRoutine(
 	}
 }
 
-// clockRoutine envia ticks do simulador.
 func clockRoutine(ctx context.Context, tickCh chan<- struct{}, interval time.Duration, wg *sync.WaitGroup) {
 	defer wg.Done()
 	t := time.NewTicker(interval)
@@ -215,7 +211,6 @@ func clockRoutine(ctx context.Context, tickCh chan<- struct{}, interval time.Dur
 	}
 }
 
-// pollRoutine multiplexa eventos do ecrã e reencaminha para o coordenador.
 func pollRoutine(ctx context.Context, s tcell.Screen, evCh chan<- tcell.Event, wg *sync.WaitGroup) {
 	defer wg.Done()
 	for {
@@ -312,7 +307,7 @@ func (w *world) clearArea(center pos, radius int) {
 
 func buildMazeBarriers(w, h int) map[pos]struct{} {
 	b := make(map[pos]struct{})
-	// Corredores horizontais com portas (estilo Pac-Man).
+	// paredes horizontais com buracos
 	for y := 3; y < h-3; y += 4 {
 		for x := 2; x < w-2; x++ {
 			if x%5 == 3 || x%5 == 4 {
@@ -321,7 +316,7 @@ func buildMazeBarriers(w, h int) map[pos]struct{} {
 			b[pos{x, y}] = struct{}{}
 		}
 	}
-	// Pilares verticais alternados.
+	// pilares verticais
 	for x := 6; x < w-6; x += 6 {
 		for y := 2; y < h-2; y++ {
 			if y%4 == 2 {
@@ -423,7 +418,7 @@ func (w *world) applyEnemyHits() {
 	}
 }
 
-// coordinatorRoutine: único dono do estado do mundo; usa select para multiplexar ticks, input e shutdown.
+// coordenador: atualiza o jogo a cada tick
 func coordinatorRoutine(
 	ctx context.Context,
 	s tcell.Screen,
@@ -501,7 +496,7 @@ func coordinatorRoutine(
 				}
 			}
 
-			// B move todo tick; A move a cada 2 ticks (mais lento que o jogador).
+			// A mais lento, B todo tick
 			if w.frame%2 == 0 {
 				w.probeA = applyDir(w, w.probeA, da)
 			}
@@ -532,7 +527,6 @@ func coordinatorRoutine(
 	}
 }
 
-// renderRoutine desenha o mundo; mutex só protege o estado de renderização (ecrã tcell).
 func renderRoutine(ctx context.Context, s tcell.Screen, renderCh <-chan world, wg *sync.WaitGroup, mu *sync.Mutex) {
 	defer wg.Done()
 	styleDef := tcell.StyleDefault
@@ -633,7 +627,7 @@ func main() {
 
 	shutdown := func() {
 		cancel()
-		// Desbloqueia PollEvent para a goroutine de eventos terminar ordenadamente.
+		// libera o PollEvent ao sair
 		_ = s.PostEvent(tcell.NewEventInterrupt(nil))
 	}
 
